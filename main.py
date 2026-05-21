@@ -1,31 +1,45 @@
 #!/usr/bin/env python3
-"""CSV to XLSX Converter.
+"""CSV to XLSX Converter + Facebook Audience Formatter.
 
-Handles large (500k+ rows, 670MB+), RFC 4180 compliant CSV files that
-break in Excel / Google Sheets. All cells are treated as text so UUIDs,
-phone numbers, leading-zero zip codes, and ranges like "$20,000 to $44,999"
-are preserved exactly.
+Two functions, two tabs:
+
+  1. Converter — RFC 4180 CSV (500k+ rows, 670MB+) → XLSX, treating every
+     cell as text so UUIDs, phone numbers, leading-zero zips, and ranges
+     like "$20,000 to $44,999" are preserved exactly.
+
+  2. Facebook Audience Formatter — turn a raw or converted contact list
+     into a Meta Custom Audience-ready CSV/XLSX. Splits multi-value
+     email/phone columns into EMAIL/EMAIL_2/EMAIL_3 + PHONE/PHONE_2,
+     emits SHA256-hashed siblings alongside plaintext (both toggleable),
+     normalizes per Meta's hashing spec.
 
 Architecture:
   - PyQt6 UI on the main thread (drag/drop, preview, progress).
-  - Polars on a worker thread for parsing; pandas chunked fallback if
-    Polars fails or isn't available on this platform.
-  - xlsxwriter in constant_memory mode for the write side, so we never
-    hold an in-memory copy of the workbook.
+  - Polars on a worker thread for parsing the converter input; pandas
+    chunked fallback if Polars fails or isn't available on this platform.
+  - xlsxwriter in constant_memory mode for the write side.
+  - Formatter uses stdlib csv + openpyxl read-only iteration so it
+    streams instead of slurping; SHA256 hashing happens row-by-row.
 """
 
+import csv
+import hashlib
 import os
+import re
 import subprocess
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -36,6 +50,8 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -58,6 +74,13 @@ except Exception:
 import pandas as pd
 import xlsxwriter
 
+try:
+    from openpyxl import load_workbook
+
+    OPENPYXL_AVAILABLE = True
+except Exception:
+    OPENPYXL_AVAILABLE = False
+
 
 def human_size(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -67,7 +90,9 @@ def human_size(n: float) -> str:
     return f"{n:.1f} TB"
 
 
-# ---------- workers ---------------------------------------------------
+# =====================================================================
+# Converter: CSV -> XLSX
+# =====================================================================
 
 
 class RowCountWorker(QThread):
@@ -258,14 +283,465 @@ class ConvertWorker(QThread):
             sheet.write_string(0, c, "" if name is None else str(name), fmt)
 
 
-# ---------- widgets ---------------------------------------------------
+# =====================================================================
+# Facebook Audience Formatter
+# =====================================================================
+
+# Facebook Custom Audience field names per Meta's hashing spec.
+# Reference: https://www.facebook.com/business/help/606443329504150
+FB_FIELDS = [
+    "EXTERN_ID",
+    "FN",
+    "LN",
+    "EMAIL",
+    "PHONE",
+    "ZIP",
+    "CT",
+    "ST",
+    "COUNTRY",
+    "DOB",
+    "GEN",
+]
+
+# Heuristics for auto-mapping common source column names to FB fields.
+# Matched case-insensitively; exact match first, substring fallback.
+AUTO_MAP = {
+    "EXTERN_ID": ["uuid", "id", "extern_id", "external_id", "person_id"],
+    "FN": ["first_name", "fn", "firstname", "given_name"],
+    "LN": ["last_name", "ln", "lastname", "surname", "family_name"],
+    "EMAIL": [
+        "personal_verified_emails",
+        "personal_emails",
+        "email",
+        "emails",
+        "email_address",
+    ],
+    "PHONE": [
+        "valid_phones",
+        "mobile_phone",
+        "phone",
+        "phones",
+        "cell",
+        "mobile",
+    ],
+    "ZIP": ["zip", "zip_code", "postal_code", "postcode"],
+    "CT": ["city", "ct"],
+    "ST": ["state", "st", "region"],
+    "COUNTRY": ["country", "country_code", "iso_country"],
+    "DOB": ["dob", "date_of_birth", "birthdate", "birth_date"],
+    "GEN": ["gender", "sex", "gen"],
+}
+
+
+def auto_map_columns(fb_field: str, columns: list) -> str:
+    """Pick the most likely source column for fb_field, or '' if none fit."""
+    patterns = AUTO_MAP.get(fb_field, [])
+    lower = [c.lower() for c in columns]
+    for pat in patterns:
+        for i, c in enumerate(lower):
+            if c == pat:
+                return columns[i]
+    for pat in patterns:
+        for i, c in enumerate(lower):
+            if pat in c:
+                return columns[i]
+    return ""
+
+
+# --- normalization helpers (Meta's hashing rules) ---------------------
+
+
+def norm_email(s: str) -> str:
+    return s.strip().lower() if s else ""
+
+
+def norm_phone(s: str, country_prefix: str = "1") -> str:
+    """Strip everything but digits. If 10 digits (US local), prepend the
+    given country prefix so the value is in E.164 form minus the '+'."""
+    if not s:
+        return ""
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return ""
+    if len(digits) == 10 and country_prefix:
+        digits = country_prefix + digits
+    return digits
+
+
+def norm_name(s: str) -> str:
+    if not s:
+        return ""
+    return re.sub(r"\s+", "", s.strip().lower())
+
+
+def norm_zip(s: str) -> str:
+    if not s:
+        return ""
+    s = s.strip().lower()
+    # US ZIP+4: take just the 5-digit prefix.
+    if "-" in s:
+        s = s.split("-")[0]
+    return s
+
+
+def norm_city(s: str) -> str:
+    if not s:
+        return ""
+    return re.sub(r"\s+", "", s.strip().lower())
+
+
+def norm_state(s: str) -> str:
+    if not s:
+        return ""
+    return s.strip().lower()[:2]
+
+
+def norm_country(s: str) -> str:
+    if not s:
+        return ""
+    return s.strip().lower()[:2]
+
+
+def norm_gender(s: str) -> str:
+    if not s:
+        return ""
+    c = s.strip().lower()[:1]
+    return c if c in ("m", "f") else ""
+
+
+def parse_dob(s: str) -> tuple:
+    """Return (Y, M, D) strings from a DOB; ('','','') if unparseable.
+    Accepts YYYY-MM-DD, MM/DD/YYYY, M/D/YY, YYYYMMDD, and dot-separated."""
+    if not s:
+        return "", "", ""
+    s = s.strip()
+    m = re.match(r"(\d{4})[-/\.](\d{1,2})[-/\.](\d{1,2})", s)
+    if m:
+        return m.group(1), m.group(2).zfill(2), m.group(3).zfill(2)
+    m = re.match(r"(\d{1,2})[-/\.](\d{1,2})[-/\.](\d{2,4})", s)
+    if m:
+        y = m.group(3)
+        if len(y) == 2:
+            y = "19" + y if int(y) > 30 else "20" + y
+        return y, m.group(1).zfill(2), m.group(2).zfill(2)
+    m = re.match(r"(\d{4})(\d{2})(\d{2})", s)
+    if m:
+        return m.group(1), m.group(2), m.group(3)
+    return "", "", ""
+
+
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest() if s else ""
+
+
+# --- input file reading (CSV + XLSX, streaming) ------------------------
+
+
+def read_input_columns(path: str) -> list:
+    """Return the header columns of a CSV or XLSX without reading the body."""
+    ext = Path(path).suffix.lower()
+    if ext == ".csv":
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.reader(f)
+            return next(reader, [])
+    if ext in (".xlsx", ".xlsm"):
+        if not OPENPYXL_AVAILABLE:
+            raise RuntimeError("openpyxl is required to read XLSX files.")
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            # Use the first Data_* sheet if present (matches the converter's
+            # multi-sheet output), otherwise the active sheet.
+            sheets = [s for s in wb.sheetnames if s.startswith("Data_")] or [
+                wb.active.title
+            ]
+            ws = wb[sheets[0]]
+            header_row = next(ws.iter_rows(values_only=True), ())
+            return [str(c) if c is not None else "" for c in header_row]
+        finally:
+            wb.close()
+    raise ValueError(f"Unsupported file type: {ext}")
+
+
+def iter_input_rows(path: str) -> Iterator[dict]:
+    """Stream rows from CSV or XLSX as dicts of {column: string}.
+    For XLSX, all sheets named Data_* are read in order; if none exist,
+    only the active sheet is read."""
+    ext = Path(path).suffix.lower()
+    if ext == ".csv":
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                yield {k: ("" if v is None else str(v)) for k, v in row.items()}
+        return
+    if ext in (".xlsx", ".xlsm"):
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            sheets = [s for s in wb.sheetnames if s.startswith("Data_")] or [
+                wb.active.title
+            ]
+            for sname in sheets:
+                ws = wb[sname]
+                header = None
+                for row in ws.iter_rows(values_only=True):
+                    if header is None:
+                        header = [str(c) if c is not None else "" for c in row]
+                        continue
+                    d = {}
+                    for i, c in enumerate(row):
+                        if i < len(header):
+                            d[header[i]] = "" if c is None else str(c)
+                    yield d
+        finally:
+            wb.close()
+        return
+    raise ValueError(f"Unsupported file type: {ext}")
+
+
+def count_input_rows(path: str) -> int:
+    """Approximate row count for progress reporting. Exact for XLSX,
+    approximate for CSVs that contain quoted newlines."""
+    ext = Path(path).suffix.lower()
+    if ext == ".csv":
+        count = 0
+        with open(path, "rb") as f:
+            for _ in f:
+                count += 1
+        return max(0, count - 1)
+    if ext in (".xlsx", ".xlsm"):
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            sheets = [s for s in wb.sheetnames if s.startswith("Data_")] or [
+                wb.active.title
+            ]
+            total = 0
+            for sname in sheets:
+                ws = wb[sname]
+                total += max(0, (ws.max_row or 0) - 1)
+            return total
+        finally:
+            wb.close()
+    return 0
+
+
+# --- formatter worker --------------------------------------------------
+
+
+class AudienceFormatWorker(QThread):
+    progress = pyqtSignal(int, int)  # processed, total
+    status = pyqtSignal(str)
+    warning = pyqtSignal(str)
+    failed = pyqtSignal(str)
+    done = pyqtSignal(str)
+
+    def __init__(
+        self,
+        input_path: str,
+        output_path: str,
+        mapping: dict,
+        options: dict,
+        total_rows: int,
+    ):
+        super().__init__()
+        self.input_path = input_path
+        self.output_path = output_path
+        self.mapping = mapping
+        self.options = options
+        self.total_rows = max(total_rows, 1)
+
+    def run(self) -> None:
+        try:
+            self._run()
+        except Exception as e:
+            tb = traceback.format_exc(limit=3)
+            self.failed.emit(f"{e}\n\n{tb}")
+
+    def _run(self) -> None:
+        cols = self._build_output_columns()
+        out_fmt = self.options["output_format"]
+        self.status.emit(f"Writing {out_fmt.upper()} → {self.output_path}")
+        if out_fmt == "csv":
+            self._write_csv(cols)
+        else:
+            self._write_xlsx(cols)
+        self.done.emit(self.output_path)
+
+    def _build_output_columns(self) -> list:
+        opts = self.options
+        max_e = opts["max_emails"]
+        max_p = opts["max_phones"]
+        plain = opts["include_plaintext"]
+        sha = opts["include_sha256"]
+
+        cols = ["EXTERN_ID", "FN", "LN"]
+        for i in range(max_e):
+            suffix = "" if i == 0 else f"_{i+1}"
+            if plain:
+                cols.append(f"EMAIL{suffix}")
+            if sha:
+                cols.append(f"EMAIL_SHA256{suffix}")
+        for i in range(max_p):
+            suffix = "" if i == 0 else f"_{i+1}"
+            if plain:
+                cols.append(f"PHONE{suffix}")
+            if sha:
+                cols.append(f"PHONE_SHA256{suffix}")
+        cols += ["ZIP", "CT", "ST", "COUNTRY", "DOBY", "DOBM", "DOBD", "GEN"]
+        return cols
+
+    def _build_row(self, src: dict, cols: list) -> dict:
+        m = self.mapping
+        opts = self.options
+        max_e = opts["max_emails"]
+        max_p = opts["max_phones"]
+        plain = opts["include_plaintext"]
+        sha = opts["include_sha256"]
+        sep = opts["separator"]
+        prefix = opts["country_prefix"]
+
+        out = {c: "" for c in cols}
+
+        if m.get("EXTERN_ID"):
+            out["EXTERN_ID"] = (src.get(m["EXTERN_ID"]) or "").strip()
+        if m.get("FN"):
+            out["FN"] = norm_name(src.get(m["FN"], ""))
+        if m.get("LN"):
+            out["LN"] = norm_name(src.get(m["LN"], ""))
+
+        if m.get("EMAIL"):
+            raw = src.get(m["EMAIL"], "") or ""
+            parts = [norm_email(p) for p in raw.split(sep)]
+            # dedupe while preserving order, then cap
+            seen = set()
+            uniq = []
+            for p in parts:
+                if p and p not in seen:
+                    seen.add(p)
+                    uniq.append(p)
+            uniq = uniq[:max_e]
+            for i, val in enumerate(uniq):
+                suffix = "" if i == 0 else f"_{i+1}"
+                if plain:
+                    out[f"EMAIL{suffix}"] = val
+                if sha:
+                    out[f"EMAIL_SHA256{suffix}"] = sha256_hex(val)
+
+        if m.get("PHONE"):
+            raw = src.get(m["PHONE"], "") or ""
+            parts = [norm_phone(p, prefix) for p in raw.split(sep)]
+            seen = set()
+            uniq = []
+            for p in parts:
+                if p and p not in seen:
+                    seen.add(p)
+                    uniq.append(p)
+            uniq = uniq[:max_p]
+            for i, val in enumerate(uniq):
+                suffix = "" if i == 0 else f"_{i+1}"
+                if plain:
+                    out[f"PHONE{suffix}"] = val
+                if sha:
+                    out[f"PHONE_SHA256{suffix}"] = sha256_hex(val)
+
+        if m.get("ZIP"):
+            out["ZIP"] = norm_zip(src.get(m["ZIP"], ""))
+        if m.get("CT"):
+            out["CT"] = norm_city(src.get(m["CT"], ""))
+        if m.get("ST"):
+            out["ST"] = norm_state(src.get(m["ST"], ""))
+        if m.get("COUNTRY"):
+            out["COUNTRY"] = norm_country(src.get(m["COUNTRY"], ""))
+        if m.get("DOB"):
+            y, mo, d = parse_dob(src.get(m["DOB"], ""))
+            out["DOBY"] = y
+            out["DOBM"] = mo
+            out["DOBD"] = d
+        if m.get("GEN"):
+            out["GEN"] = norm_gender(src.get(m["GEN"], ""))
+
+        return out
+
+    def _write_csv(self, cols: list) -> None:
+        emit_every = max(1, min(5000, self.total_rows // 100 or 1))
+        processed = 0
+        with open(self.output_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=cols, quoting=csv.QUOTE_MINIMAL)
+            writer.writeheader()
+            for src in iter_input_rows(self.input_path):
+                writer.writerow(self._build_row(src, cols))
+                processed += 1
+                if processed % emit_every == 0:
+                    self.progress.emit(processed, max(self.total_rows, processed))
+                    self.status.emit(f"Formatted {processed:,} rows...")
+        self.progress.emit(processed, max(self.total_rows, processed))
+        self.status.emit(
+            f"Done. Wrote {processed:,} rows to {self.output_path}"
+        )
+
+    def _write_xlsx(self, cols: list) -> None:
+        workbook = xlsxwriter.Workbook(
+            self.output_path,
+            {
+                "constant_memory": True,
+                "strings_to_formulas": False,
+                "strings_to_urls": False,
+                "strings_to_numbers": False,
+            },
+        )
+        header_fmt = workbook.add_format({"bold": True})
+
+        sheet_idx = 1
+        sheet = workbook.add_worksheet(f"Audience_{sheet_idx}")
+        for c, name in enumerate(cols):
+            sheet.write_string(0, c, name, header_fmt)
+
+        max_data_rows = EXCEL_MAX_ROWS - 1
+        row_in_sheet = 1
+        processed = 0
+        emit_every = max(1, min(5000, self.total_rows // 100 or 1))
+
+        for src in iter_input_rows(self.input_path):
+            if row_in_sheet > max_data_rows:
+                sheet_idx += 1
+                sheet = workbook.add_worksheet(f"Audience_{sheet_idx}")
+                for c, name in enumerate(cols):
+                    sheet.write_string(0, c, name, header_fmt)
+                row_in_sheet = 1
+                self.warning.emit(
+                    f"Row limit reached, continuing in Audience_{sheet_idx}."
+                )
+            row = self._build_row(src, cols)
+            for c, name in enumerate(cols):
+                v = row.get(name, "")
+                if v:
+                    sheet.write_string(row_in_sheet, c, v)
+            row_in_sheet += 1
+            processed += 1
+            if processed % emit_every == 0:
+                self.progress.emit(processed, max(self.total_rows, processed))
+                self.status.emit(f"Formatted {processed:,} rows...")
+
+        workbook.close()
+        self.progress.emit(processed, max(self.total_rows, processed))
+        self.status.emit(
+            f"Done. Wrote {processed:,} rows to {self.output_path}"
+        )
+
+
+# =====================================================================
+# Widgets
+# =====================================================================
 
 
 class DropZone(QFrame):
     file_dropped = pyqtSignal(str)
     clicked = pyqtSignal()
 
-    def __init__(self):
+    def __init__(
+        self,
+        accept_extensions=(".csv",),
+        title_text="Drop a .csv file here",
+        sub_text="or use the Choose File button below",
+    ):
         super().__init__()
         self.setObjectName("DropZone")
         self.setAcceptDrops(True)
@@ -274,16 +750,17 @@ class DropZone(QFrame):
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
         )
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._accept = tuple(e.lower() for e in accept_extensions)
 
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title = QLabel("Drop a .csv file here")
+        title = QLabel(title_text)
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         f = title.font()
         f.setPointSize(16)
         f.setBold(True)
         title.setFont(f)
-        sub = QLabel("or use the Choose File button below")
+        sub = QLabel(sub_text)
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet("color: #9d9d9d;")
         layout.addWidget(title)
@@ -291,6 +768,9 @@ class DropZone(QFrame):
 
         self._active = False
         self._restyle()
+
+    def _accepts(self, path: str) -> bool:
+        return path.lower().endswith(self._accept)
 
     def _restyle(self) -> None:
         border = "#007acc" if self._active else "#3e3e42"
@@ -302,7 +782,7 @@ class DropZone(QFrame):
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
-        if any(u.toLocalFile().lower().endswith(".csv") for u in urls):
+        if any(self._accepts(u.toLocalFile()) for u in urls):
             event.acceptProposedAction()
             self._active = True
             self._restyle()
@@ -314,7 +794,7 @@ class DropZone(QFrame):
     def dropEvent(self, event: QDropEvent) -> None:
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if path.lower().endswith(".csv"):
+            if self._accepts(path):
                 self.file_dropped.emit(path)
                 break
         self._active = False
@@ -325,25 +805,45 @@ class DropZone(QFrame):
             self.clicked.emit()
 
 
-# ---------- main window -----------------------------------------------
+# =====================================================================
+# Main window
+# =====================================================================
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CSV to XLSX Converter")
-        self.resize(920, 800)
+        self.resize(960, 820)
 
+        # Converter tab state
         self.input_path: Optional[str] = None
         self.output_path: Optional[str] = None
         self.row_count: int = 0
-        self.warnings_log: list[str] = []
+        self.warnings_log: list = []
         self.count_worker: Optional[RowCountWorker] = None
         self.convert_worker: Optional[ConvertWorker] = None
 
-        root = QWidget()
-        self.setCentralWidget(root)
-        layout = QVBoxLayout(root)
+        # Formatter tab state
+        self.fmt_input_path: Optional[str] = None
+        self.fmt_output_path: Optional[str] = None
+        self.fmt_columns: list = []
+        self.fmt_worker: Optional[AudienceFormatWorker] = None
+
+        tabs = QTabWidget()
+        tabs.addTab(self._build_converter_tab(), "CSV → XLSX Converter")
+        tabs.addTab(
+            self._build_formatter_tab(), "Facebook Audience Formatter"
+        )
+        self.setCentralWidget(tabs)
+
+    # ---------------------------------------------------------------
+    # Converter tab
+    # ---------------------------------------------------------------
+
+    def _build_converter_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
@@ -420,7 +920,9 @@ class MainWindow(QMainWindow):
         self.open_folder_btn.setVisible(False)
         layout.addWidget(self.open_folder_btn)
 
-    # ---- input ----
+        return page
+
+    # ---- converter handlers ----
 
     def choose_input_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -512,9 +1014,9 @@ class MainWindow(QMainWindow):
         return os.access(folder, os.W_OK)
 
     def _refresh_convert_enabled(self) -> None:
-        self.convert_btn.setEnabled(bool(self.input_path and self.output_path))
-
-    # ---- convert ----
+        self.convert_btn.setEnabled(
+            bool(self.input_path and self.output_path)
+        )
 
     def start_convert(self) -> None:
         if not self.input_path or not self.output_path:
@@ -561,7 +1063,9 @@ class MainWindow(QMainWindow):
     def _log_warning(self, msg: str) -> None:
         self.warnings_log.append(msg)
         self.warnings_view.append(msg)
-        self.warnings_group.setTitle(f"Warnings ({len(self.warnings_log)})")
+        self.warnings_group.setTitle(
+            f"Warnings ({len(self.warnings_log)})"
+        )
 
     def _on_failed(self, msg: str) -> None:
         self.convert_btn.setEnabled(True)
@@ -588,6 +1092,381 @@ class MainWindow(QMainWindow):
         if not self.output_path:
             return
         subprocess.run(["open", os.path.dirname(self.output_path)])
+
+    # ---------------------------------------------------------------
+    # Facebook Audience Formatter tab
+    # ---------------------------------------------------------------
+
+    FIELD_LABELS = {
+        "EXTERN_ID": "External ID (UUID)",
+        "FN": "First name",
+        "LN": "Last name",
+        "EMAIL": "Email column (multi-value OK)",
+        "PHONE": "Phone column (multi-value OK)",
+        "ZIP": "Zip / Postal code",
+        "CT": "City",
+        "ST": "State (2-char)",
+        "COUNTRY": "Country (2-char ISO)",
+        "DOB": "Date of birth",
+        "GEN": "Gender",
+    }
+
+    def _build_formatter_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        intro = QLabel(
+            "Format a contact list for Meta Custom Audience upload. "
+            "Splits multi-value email/phone columns into EMAIL_2, "
+            "EMAIL_3 etc., normalizes per Meta's hashing spec, and emits "
+            "plaintext + SHA256 columns side by side so you can choose "
+            "which to upload."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #9d9d9d;")
+        layout.addWidget(intro)
+
+        # Drop zone
+        self.fmt_drop_zone = DropZone(
+            accept_extensions=(".csv", ".xlsx", ".xlsm"),
+            title_text="Drop a .csv or .xlsx file here",
+            sub_text="or use the Choose File button below",
+        )
+        self.fmt_drop_zone.file_dropped.connect(self.fmt_set_input)
+        self.fmt_drop_zone.clicked.connect(self.fmt_choose_input)
+        layout.addWidget(self.fmt_drop_zone)
+
+        # File row
+        row = QHBoxLayout()
+        self.fmt_choose_btn = QPushButton("Choose CSV/XLSX…")
+        self.fmt_choose_btn.clicked.connect(self.fmt_choose_input)
+        self.fmt_file_info = QLabel("No file selected")
+        self.fmt_file_info.setStyleSheet("color: #9d9d9d;")
+        row.addWidget(self.fmt_choose_btn)
+        row.addWidget(self.fmt_file_info, 1)
+        layout.addLayout(row)
+
+        # Column mapping
+        self.fmt_mapping_group = QGroupBox(
+            "Column mapping (auto-detected; override as needed)"
+        )
+        mapping_layout = QFormLayout(self.fmt_mapping_group)
+        self.fmt_combos: dict = {}
+        for field in FB_FIELDS:
+            cb = QComboBox()
+            cb.setEnabled(False)
+            self.fmt_combos[field] = cb
+            mapping_layout.addRow(self.FIELD_LABELS[field], cb)
+        layout.addWidget(self.fmt_mapping_group)
+
+        # Options
+        opts = QGroupBox("Options")
+        opt_layout = QFormLayout(opts)
+
+        self.fmt_separator = QComboBox()
+        self.fmt_separator.addItems(
+            [", (comma)", "; (semicolon)", "| (pipe)", "tab"]
+        )
+        opt_layout.addRow("Multi-value separator:", self.fmt_separator)
+
+        self.fmt_max_emails = QSpinBox()
+        self.fmt_max_emails.setRange(1, 10)
+        self.fmt_max_emails.setValue(3)
+        opt_layout.addRow("Max emails per row:", self.fmt_max_emails)
+
+        self.fmt_max_phones = QSpinBox()
+        self.fmt_max_phones.setRange(1, 10)
+        self.fmt_max_phones.setValue(2)
+        opt_layout.addRow("Max phones per row:", self.fmt_max_phones)
+
+        self.fmt_country_prefix = QComboBox()
+        self.fmt_country_prefix.setEditable(True)
+        self.fmt_country_prefix.addItems(
+            ["1 (US/CA)", "44 (UK)", "61 (AU)", "(none)"]
+        )
+        opt_layout.addRow(
+            "Default country code (for 10-digit numbers):",
+            self.fmt_country_prefix,
+        )
+
+        self.fmt_include_plaintext = QCheckBox(
+            "Include plaintext columns (EMAIL, PHONE, …)"
+        )
+        self.fmt_include_plaintext.setChecked(True)
+        opt_layout.addRow("", self.fmt_include_plaintext)
+
+        self.fmt_include_sha256 = QCheckBox(
+            "Include SHA256-hashed columns (EMAIL_SHA256, …)"
+        )
+        self.fmt_include_sha256.setChecked(True)
+        opt_layout.addRow("", self.fmt_include_sha256)
+
+        self.fmt_output_format = QComboBox()
+        self.fmt_output_format.addItems(
+            ["CSV (recommended for Meta upload)", "XLSX"]
+        )
+        self.fmt_output_format.currentIndexChanged.connect(
+            self._fmt_on_format_change
+        )
+        opt_layout.addRow("Output format:", self.fmt_output_format)
+
+        layout.addWidget(opts)
+
+        # Output picker + action
+        out_row = QHBoxLayout()
+        self.fmt_choose_out_btn = QPushButton("Choose Output Location…")
+        self.fmt_choose_out_btn.clicked.connect(self.fmt_choose_output)
+        self.fmt_out_label = QLabel("Output: (will default once input is set)")
+        self.fmt_out_label.setStyleSheet("color: #9d9d9d;")
+        out_row.addWidget(self.fmt_choose_out_btn)
+        out_row.addWidget(self.fmt_out_label, 1)
+        layout.addLayout(out_row)
+
+        self.fmt_format_btn = QPushButton("Format && Save")
+        self.fmt_format_btn.setEnabled(False)
+        self.fmt_format_btn.clicked.connect(self.fmt_start)
+        f = self.fmt_format_btn.font()
+        f.setBold(True)
+        f.setPointSize(f.pointSize() + 1)
+        self.fmt_format_btn.setFont(f)
+        layout.addWidget(self.fmt_format_btn)
+
+        self.fmt_progress = QProgressBar()
+        self.fmt_progress.setValue(0)
+        layout.addWidget(self.fmt_progress)
+        self.fmt_status = QLabel("Idle.")
+        self.fmt_status.setWordWrap(True)
+        layout.addWidget(self.fmt_status)
+
+        self.fmt_open_folder_btn = QPushButton("Open Output Folder")
+        self.fmt_open_folder_btn.clicked.connect(self.fmt_open_output_folder)
+        self.fmt_open_folder_btn.setVisible(False)
+        layout.addWidget(self.fmt_open_folder_btn)
+
+        layout.addStretch(1)
+        return page
+
+    # ---- formatter handlers ----
+
+    def fmt_choose_input(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose CSV or XLSX",
+            str(Path.home()),
+            "Data files (*.csv *.xlsx);;CSV (*.csv);;Excel (*.xlsx);;All files (*)",
+        )
+        if path:
+            self.fmt_set_input(path)
+
+    def fmt_set_input(self, path: str) -> None:
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "Not a file", f"Can't read: {path}")
+            return
+        ext = Path(path).suffix.lower()
+        if ext not in (".csv", ".xlsx", ".xlsm"):
+            QMessageBox.warning(
+                self, "Unsupported", "Pick a .csv or .xlsx file."
+            )
+            return
+
+        self.fmt_input_path = path
+        size = os.path.getsize(path)
+        self.fmt_file_info.setText(
+            f"{Path(path).name} — {human_size(size)} — reading columns…"
+        )
+        try:
+            cols = read_input_columns(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Couldn't read file", str(e))
+            self.fmt_file_info.setText("Couldn't read file.")
+            return
+        self.fmt_columns = cols
+        self.fmt_file_info.setText(
+            f"{Path(path).name} — {human_size(size)} — {len(cols)} columns detected"
+        )
+        self._fmt_populate_mapping(cols)
+        self._fmt_set_default_output(path)
+        self._fmt_refresh_enabled()
+
+    def _fmt_populate_mapping(self, cols: list) -> None:
+        for field, combo in self.fmt_combos.items():
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(none)", userData="")
+            for c in cols:
+                combo.addItem(c, userData=c)
+            combo.setEnabled(True)
+            auto = auto_map_columns(field, cols)
+            if auto:
+                idx = combo.findData(auto)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+
+    def _fmt_set_default_output(self, input_path: str) -> None:
+        out_fmt = self._fmt_current_output_format()
+        p = Path(input_path)
+        default = p.with_name(p.stem + "_facebook." + out_fmt)
+        self.fmt_output_path = str(default)
+        self.fmt_out_label.setText(f"Output: {self.fmt_output_path}")
+
+    def _fmt_current_output_format(self) -> str:
+        return (
+            "csv" if "CSV" in self.fmt_output_format.currentText() else "xlsx"
+        )
+
+    def _fmt_on_format_change(self) -> None:
+        # Keep the default output path's extension in sync with the chosen format.
+        if not self.fmt_output_path:
+            return
+        out_fmt = self._fmt_current_output_format()
+        p = Path(self.fmt_output_path)
+        new_path = str(p.with_suffix("." + out_fmt))
+        self.fmt_output_path = new_path
+        self.fmt_out_label.setText(f"Output: {self.fmt_output_path}")
+
+    def fmt_choose_output(self) -> None:
+        out_fmt = self._fmt_current_output_format()
+        default = self.fmt_output_path or str(
+            Path.home() / f"audience.{out_fmt}"
+        )
+        filter_str = (
+            "CSV (*.csv)" if out_fmt == "csv" else "Excel workbook (*.xlsx)"
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save as", default, filter_str
+        )
+        if not path:
+            return
+        ext = "." + out_fmt
+        if not path.lower().endswith(ext):
+            path += ext
+        if not self._output_writable(path):
+            QMessageBox.warning(
+                self,
+                "Cannot write here",
+                "That folder isn't writable. Pick another location.",
+            )
+            return
+        self.fmt_output_path = path
+        self.fmt_out_label.setText(f"Output: {self.fmt_output_path}")
+        self._fmt_refresh_enabled()
+
+    def _fmt_refresh_enabled(self) -> None:
+        self.fmt_format_btn.setEnabled(
+            bool(self.fmt_input_path and self.fmt_output_path)
+        )
+
+    def fmt_start(self) -> None:
+        if not self.fmt_input_path or not self.fmt_output_path:
+            return
+
+        mapping: dict = {}
+        for field, combo in self.fmt_combos.items():
+            val = combo.currentData()
+            if val:
+                mapping[field] = val
+
+        sep_text = self.fmt_separator.currentText()
+        separator = "\t" if "tab" in sep_text else sep_text.split(" ")[0]
+
+        prefix_text = self.fmt_country_prefix.currentText()
+        if "(none)" in prefix_text:
+            country_prefix = ""
+        else:
+            # Take the first whitespace-separated token; works for both
+            # the canned items ("1 (US/CA)") and free-typed values.
+            country_prefix = re.sub(r"\D", "", prefix_text.split(" ")[0])
+
+        options = {
+            "max_emails": self.fmt_max_emails.value(),
+            "max_phones": self.fmt_max_phones.value(),
+            "include_plaintext": self.fmt_include_plaintext.isChecked(),
+            "include_sha256": self.fmt_include_sha256.isChecked(),
+            "separator": separator,
+            "country_prefix": country_prefix,
+            "output_format": self._fmt_current_output_format(),
+        }
+
+        if not options["include_plaintext"] and not options["include_sha256"]:
+            QMessageBox.warning(
+                self,
+                "Nothing to output",
+                "Enable at least one of plaintext or SHA256 columns.",
+            )
+            return
+
+        # Sync output extension to format.
+        expected_ext = "." + options["output_format"]
+        if not self.fmt_output_path.lower().endswith(expected_ext):
+            self.fmt_output_path = str(
+                Path(self.fmt_output_path).with_suffix(expected_ext)
+            )
+            self.fmt_out_label.setText(f"Output: {self.fmt_output_path}")
+
+        try:
+            total = count_input_rows(self.fmt_input_path)
+        except Exception:
+            total = 0
+
+        self.fmt_open_folder_btn.setVisible(False)
+        self.fmt_format_btn.setEnabled(False)
+        self.fmt_choose_btn.setEnabled(False)
+        self.fmt_choose_out_btn.setEnabled(False)
+
+        if total > 0:
+            self.fmt_progress.setRange(0, total)
+            self.fmt_progress.setValue(0)
+        else:
+            self.fmt_progress.setRange(0, 0)
+        self.fmt_status.setText("Starting…")
+
+        self.fmt_worker = AudienceFormatWorker(
+            self.fmt_input_path,
+            self.fmt_output_path,
+            mapping,
+            options,
+            total,
+        )
+        self.fmt_worker.progress.connect(self._fmt_on_progress)
+        self.fmt_worker.status.connect(self.fmt_status.setText)
+        self.fmt_worker.failed.connect(self._fmt_on_failed)
+        self.fmt_worker.done.connect(self._fmt_on_done)
+        self.fmt_worker.start()
+
+    def _fmt_on_progress(self, processed: int, total: int) -> None:
+        if total > 0:
+            if self.fmt_progress.maximum() != total:
+                self.fmt_progress.setRange(0, total)
+            self.fmt_progress.setValue(min(processed, total))
+
+    def _fmt_on_failed(self, msg: str) -> None:
+        self.fmt_format_btn.setEnabled(True)
+        self.fmt_choose_btn.setEnabled(True)
+        self.fmt_choose_out_btn.setEnabled(True)
+        self.fmt_progress.setRange(0, 100)
+        self.fmt_progress.setValue(0)
+        self.fmt_status.setText("Formatting failed.")
+        QMessageBox.critical(self, "Formatting failed", msg)
+
+    def _fmt_on_done(self, output_path: str) -> None:
+        self.fmt_format_btn.setEnabled(True)
+        self.fmt_choose_btn.setEnabled(True)
+        self.fmt_choose_out_btn.setEnabled(True)
+        if self.fmt_progress.maximum() == 0:
+            self.fmt_progress.setRange(0, 1)
+            self.fmt_progress.setValue(1)
+        else:
+            self.fmt_progress.setValue(self.fmt_progress.maximum())
+        self.fmt_status.setText(f"Done. Saved to: {output_path}")
+        self.fmt_open_folder_btn.setVisible(True)
+
+    def fmt_open_output_folder(self) -> None:
+        if not self.fmt_output_path:
+            return
+        subprocess.run(["open", os.path.dirname(self.fmt_output_path)])
 
 
 DARK_STYLESHEET = """
@@ -621,6 +1500,26 @@ QGroupBox {
     margin-top: 10px; padding-top: 12px; color: #e0e0e0;
 }
 QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+QTabWidget::pane { border: 1px solid #3e3e42; top: -1px; }
+QTabBar::tab {
+    background: #2d2d30; color: #e0e0e0;
+    padding: 8px 14px; border: 1px solid #3e3e42; border-bottom: none;
+    border-top-left-radius: 6px; border-top-right-radius: 6px;
+    margin-right: 2px;
+}
+QTabBar::tab:selected { background: #1e1e1e; border-color: #007acc; }
+QTabBar::tab:!selected:hover { background: #3e3e42; }
+QComboBox, QSpinBox {
+    background-color: #2d2d30; color: #e0e0e0;
+    border: 1px solid #3e3e42; padding: 4px 8px; border-radius: 4px;
+    min-height: 22px;
+}
+QComboBox:hover, QSpinBox:hover { border-color: #007acc; }
+QComboBox QAbstractItemView {
+    background-color: #2d2d30; color: #e0e0e0;
+    selection-background-color: #007acc;
+}
+QCheckBox { color: #e0e0e0; spacing: 6px; }
 """
 
 
