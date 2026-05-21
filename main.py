@@ -41,14 +41,18 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QTabWidget,
@@ -289,12 +293,13 @@ class ConvertWorker(QThread):
 
 # Facebook Custom Audience field names per Meta's hashing spec.
 # Reference: https://www.facebook.com/business/help/606443329504150
-FB_FIELDS = [
+#
+# EMAIL and PHONE are handled as multi-source (a row can pull from any
+# number of input columns); everything else is a single-source mapping.
+FB_SINGLE_FIELDS = [
     "EXTERN_ID",
     "FN",
     "LN",
-    "EMAIL",
-    "PHONE",
     "ZIP",
     "CT",
     "ST",
@@ -309,21 +314,6 @@ AUTO_MAP = {
     "EXTERN_ID": ["uuid", "id", "extern_id", "external_id", "person_id"],
     "FN": ["first_name", "fn", "firstname", "given_name"],
     "LN": ["last_name", "ln", "lastname", "surname", "family_name"],
-    "EMAIL": [
-        "personal_verified_emails",
-        "personal_emails",
-        "email",
-        "emails",
-        "email_address",
-    ],
-    "PHONE": [
-        "valid_phones",
-        "mobile_phone",
-        "phone",
-        "phones",
-        "cell",
-        "mobile",
-    ],
     "ZIP": ["zip", "zip_code", "postal_code", "postcode"],
     "CT": ["city", "ct"],
     "ST": ["state", "st", "region"],
@@ -331,6 +321,10 @@ AUTO_MAP = {
     "DOB": ["dob", "date_of_birth", "birthdate", "birth_date"],
     "GEN": ["gender", "sex", "gen"],
 }
+
+# Substring patterns for auto-checking multi-source email / phone lists.
+EMAIL_COLUMN_PATTERNS = ["email", "e-mail", "e_mail"]
+PHONE_COLUMN_PATTERNS = ["phone", "mobile", "cell", "msisdn"]
 
 
 def auto_map_columns(fb_field: str, columns: list) -> str:
@@ -566,26 +560,52 @@ class AudienceFormatWorker(QThread):
         self.done.emit(self.output_path)
 
     def _build_output_columns(self) -> list:
+        """Build the output schema. A column is only emitted if its source
+        is actually mapped — that's how the user controls how wide the
+        output is. EMAIL/PHONE expand to N columns based on the max
+        spinners; the others are single columns (DOB expands to 3)."""
         opts = self.options
+        m = self.mapping
         max_e = opts["max_emails"]
         max_p = opts["max_phones"]
         plain = opts["include_plaintext"]
         sha = opts["include_sha256"]
 
-        cols = ["EXTERN_ID", "FN", "LN"]
-        for i in range(max_e):
-            suffix = "" if i == 0 else f"_{i+1}"
-            if plain:
-                cols.append(f"EMAIL{suffix}")
-            if sha:
-                cols.append(f"EMAIL_SHA256{suffix}")
-        for i in range(max_p):
-            suffix = "" if i == 0 else f"_{i+1}"
-            if plain:
-                cols.append(f"PHONE{suffix}")
-            if sha:
-                cols.append(f"PHONE_SHA256{suffix}")
-        cols += ["ZIP", "CT", "ST", "COUNTRY", "DOBY", "DOBM", "DOBD", "GEN"]
+        cols: list = []
+        if m.get("EXTERN_ID"):
+            cols.append("EXTERN_ID")
+        if m.get("FN"):
+            cols.append("FN")
+        if m.get("LN"):
+            cols.append("LN")
+
+        if m.get("EMAIL_SOURCES"):
+            for i in range(max_e):
+                suffix = "" if i == 0 else f"_{i+1}"
+                if plain:
+                    cols.append(f"EMAIL{suffix}")
+                if sha:
+                    cols.append(f"EMAIL_SHA256{suffix}")
+        if m.get("PHONE_SOURCES"):
+            for i in range(max_p):
+                suffix = "" if i == 0 else f"_{i+1}"
+                if plain:
+                    cols.append(f"PHONE{suffix}")
+                if sha:
+                    cols.append(f"PHONE_SHA256{suffix}")
+
+        if m.get("ZIP"):
+            cols.append("ZIP")
+        if m.get("CT"):
+            cols.append("CT")
+        if m.get("ST"):
+            cols.append("ST")
+        if m.get("COUNTRY"):
+            cols.append("COUNTRY")
+        if m.get("DOB"):
+            cols += ["DOBY", "DOBM", "DOBD"]
+        if m.get("GEN"):
+            cols.append("GEN")
         return cols
 
     def _build_row(self, src: dict, cols: list) -> dict:
@@ -607,14 +627,19 @@ class AudienceFormatWorker(QThread):
         if m.get("LN"):
             out["LN"] = norm_name(src.get(m["LN"], ""))
 
-        if m.get("EMAIL"):
-            raw = src.get(m["EMAIL"], "") or ""
-            parts = [norm_email(p) for p in raw.split(sep)]
-            # dedupe while preserving order, then cap
+        # Email: pool across every selected source column, dedupe, cap.
+        if m.get("EMAIL_SOURCES"):
+            collected: list = []
+            for col in m["EMAIL_SOURCES"]:
+                raw = src.get(col, "") or ""
+                for p in raw.split(sep):
+                    n = norm_email(p)
+                    if n:
+                        collected.append(n)
             seen = set()
             uniq = []
-            for p in parts:
-                if p and p not in seen:
+            for p in collected:
+                if p not in seen:
                     seen.add(p)
                     uniq.append(p)
             uniq = uniq[:max_e]
@@ -625,13 +650,19 @@ class AudienceFormatWorker(QThread):
                 if sha:
                     out[f"EMAIL_SHA256{suffix}"] = sha256_hex(val)
 
-        if m.get("PHONE"):
-            raw = src.get(m["PHONE"], "") or ""
-            parts = [norm_phone(p, prefix) for p in raw.split(sep)]
+        # Phone: same pattern.
+        if m.get("PHONE_SOURCES"):
+            collected = []
+            for col in m["PHONE_SOURCES"]:
+                raw = src.get(col, "") or ""
+                for p in raw.split(sep):
+                    n = norm_phone(p, prefix)
+                    if n:
+                        collected.append(n)
             seen = set()
             uniq = []
-            for p in parts:
-                if p and p not in seen:
+            for p in collected:
+                if p not in seen:
                     seen.add(p)
                     uniq.append(p)
             uniq = uniq[:max_p]
@@ -1101,39 +1132,45 @@ class MainWindow(QMainWindow):
         "EXTERN_ID": "External ID (UUID)",
         "FN": "First name",
         "LN": "Last name",
-        "EMAIL": "Email column (multi-value OK)",
-        "PHONE": "Phone column (multi-value OK)",
-        "ZIP": "Zip / Postal code",
+        "ZIP": "Zip / Postal",
         "CT": "City",
         "ST": "State (2-char)",
-        "COUNTRY": "Country (2-char ISO)",
+        "COUNTRY": "Country (2-char)",
         "DOB": "Date of birth",
         "GEN": "Gender",
     }
 
     def _build_formatter_tab(self) -> QWidget:
+        # The whole tab lives inside a scroll area so it always fits the
+        # screen regardless of how many controls are visible.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
         intro = QLabel(
             "Format a contact list for Meta Custom Audience upload. "
-            "Splits multi-value email/phone columns into EMAIL_2, "
-            "EMAIL_3 etc., normalizes per Meta's hashing spec, and emits "
-            "plaintext + SHA256 columns side by side so you can choose "
-            "which to upload."
+            "Pick the source columns for emails and phones (multiple allowed) "
+            "and which fields to pass through. Output emits plaintext and "
+            "SHA256 columns side by side."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color: #9d9d9d;")
         layout.addWidget(intro)
 
-        # Drop zone
+        # Compact drop zone (shorter than the converter's so it doesn't
+        # eat half the screen).
         self.fmt_drop_zone = DropZone(
             accept_extensions=(".csv", ".xlsx", ".xlsm"),
             title_text="Drop a .csv or .xlsx file here",
             sub_text="or use the Choose File button below",
         )
+        self.fmt_drop_zone.setMinimumHeight(100)
+        self.fmt_drop_zone.setMaximumHeight(120)
         self.fmt_drop_zone.file_dropped.connect(self.fmt_set_input)
         self.fmt_drop_zone.clicked.connect(self.fmt_choose_input)
         layout.addWidget(self.fmt_drop_zone)
@@ -1148,61 +1185,79 @@ class MainWindow(QMainWindow):
         row.addWidget(self.fmt_file_info, 1)
         layout.addLayout(row)
 
-        # Column mapping
-        self.fmt_mapping_group = QGroupBox(
-            "Column mapping (auto-detected; override as needed)"
+        # ----- Email + Phone source columns (multi-select) -----
+        sources_group = QGroupBox(
+            "Email & Phone source columns (auto-detected; uncheck to exclude)"
         )
-        mapping_layout = QFormLayout(self.fmt_mapping_group)
+        sources_layout = QGridLayout(sources_group)
+        sources_layout.setHorizontalSpacing(12)
+
+        sources_layout.addWidget(QLabel("Email source columns:"), 0, 0)
+        sources_layout.addWidget(QLabel("Phone source columns:"), 0, 1)
+
+        self.fmt_email_list = QListWidget()
+        self.fmt_email_list.setMaximumHeight(140)
+        self.fmt_email_list.itemChanged.connect(self._fmt_update_source_counts)
+        sources_layout.addWidget(self.fmt_email_list, 1, 0)
+
+        self.fmt_phone_list = QListWidget()
+        self.fmt_phone_list.setMaximumHeight(140)
+        self.fmt_phone_list.itemChanged.connect(self._fmt_update_source_counts)
+        sources_layout.addWidget(self.fmt_phone_list, 1, 1)
+
+        self.fmt_email_count_label = QLabel("0 selected")
+        self.fmt_email_count_label.setStyleSheet("color: #9d9d9d;")
+        self.fmt_phone_count_label = QLabel("0 selected")
+        self.fmt_phone_count_label.setStyleSheet("color: #9d9d9d;")
+        sources_layout.addWidget(self.fmt_email_count_label, 2, 0)
+        sources_layout.addWidget(self.fmt_phone_count_label, 2, 1)
+
+        layout.addWidget(sources_group)
+
+        # ----- Other fields (single-source dropdowns, two-column grid) -----
+        fields_group = QGroupBox(
+            "Other fields (set to '(none)' to skip in output)"
+        )
+        fields_grid = QGridLayout(fields_group)
+        fields_grid.setHorizontalSpacing(12)
+        fields_grid.setVerticalSpacing(6)
         self.fmt_combos: dict = {}
-        for field in FB_FIELDS:
+        # Lay out in two columns to keep vertical footprint small.
+        for i, field in enumerate(FB_SINGLE_FIELDS):
+            col = i // 5  # first 5 in column 0, rest in column 1
+            row_idx = i % 5
+            label = QLabel(self.FIELD_LABELS[field] + ":")
             cb = QComboBox()
             cb.setEnabled(False)
+            cb.setMinimumWidth(160)
             self.fmt_combos[field] = cb
-            mapping_layout.addRow(self.FIELD_LABELS[field], cb)
-        layout.addWidget(self.fmt_mapping_group)
+            fields_grid.addWidget(label, row_idx, col * 2)
+            fields_grid.addWidget(cb, row_idx, col * 2 + 1)
+        fields_grid.setColumnStretch(1, 1)
+        fields_grid.setColumnStretch(3, 1)
+        layout.addWidget(fields_group)
 
-        # Options
-        opts = QGroupBox("Options")
-        opt_layout = QFormLayout(opts)
+        # ----- Options (compact 2-column grid) -----
+        opts_group = QGroupBox("Options")
+        opts_grid = QGridLayout(opts_group)
+        opts_grid.setHorizontalSpacing(12)
+        opts_grid.setVerticalSpacing(6)
 
         self.fmt_separator = QComboBox()
         self.fmt_separator.addItems(
             [", (comma)", "; (semicolon)", "| (pipe)", "tab"]
         )
-        opt_layout.addRow("Multi-value separator:", self.fmt_separator)
-
         self.fmt_max_emails = QSpinBox()
-        self.fmt_max_emails.setRange(1, 10)
-        self.fmt_max_emails.setValue(3)
-        opt_layout.addRow("Max emails per row:", self.fmt_max_emails)
-
+        self.fmt_max_emails.setRange(1, 20)
+        self.fmt_max_emails.setValue(5)
         self.fmt_max_phones = QSpinBox()
-        self.fmt_max_phones.setRange(1, 10)
-        self.fmt_max_phones.setValue(2)
-        opt_layout.addRow("Max phones per row:", self.fmt_max_phones)
-
+        self.fmt_max_phones.setRange(1, 20)
+        self.fmt_max_phones.setValue(4)
         self.fmt_country_prefix = QComboBox()
         self.fmt_country_prefix.setEditable(True)
         self.fmt_country_prefix.addItems(
             ["1 (US/CA)", "44 (UK)", "61 (AU)", "(none)"]
         )
-        opt_layout.addRow(
-            "Default country code (for 10-digit numbers):",
-            self.fmt_country_prefix,
-        )
-
-        self.fmt_include_plaintext = QCheckBox(
-            "Include plaintext columns (EMAIL, PHONE, …)"
-        )
-        self.fmt_include_plaintext.setChecked(True)
-        opt_layout.addRow("", self.fmt_include_plaintext)
-
-        self.fmt_include_sha256 = QCheckBox(
-            "Include SHA256-hashed columns (EMAIL_SHA256, …)"
-        )
-        self.fmt_include_sha256.setChecked(True)
-        opt_layout.addRow("", self.fmt_include_sha256)
-
         self.fmt_output_format = QComboBox()
         self.fmt_output_format.addItems(
             ["CSV (recommended for Meta upload)", "XLSX"]
@@ -1210,15 +1265,36 @@ class MainWindow(QMainWindow):
         self.fmt_output_format.currentIndexChanged.connect(
             self._fmt_on_format_change
         )
-        opt_layout.addRow("Output format:", self.fmt_output_format)
 
-        layout.addWidget(opts)
+        opts_grid.addWidget(QLabel("Separator:"), 0, 0)
+        opts_grid.addWidget(self.fmt_separator, 0, 1)
+        opts_grid.addWidget(QLabel("Country code:"), 0, 2)
+        opts_grid.addWidget(self.fmt_country_prefix, 0, 3)
 
-        # Output picker + action
+        opts_grid.addWidget(QLabel("Max email cols:"), 1, 0)
+        opts_grid.addWidget(self.fmt_max_emails, 1, 1)
+        opts_grid.addWidget(QLabel("Max phone cols:"), 1, 2)
+        opts_grid.addWidget(self.fmt_max_phones, 1, 3)
+
+        opts_grid.addWidget(QLabel("Output format:"), 2, 0)
+        opts_grid.addWidget(self.fmt_output_format, 2, 1, 1, 3)
+
+        self.fmt_include_plaintext = QCheckBox("Include plaintext columns")
+        self.fmt_include_plaintext.setChecked(True)
+        self.fmt_include_sha256 = QCheckBox("Include SHA256 columns")
+        self.fmt_include_sha256.setChecked(True)
+        opts_grid.addWidget(self.fmt_include_plaintext, 3, 0, 1, 2)
+        opts_grid.addWidget(self.fmt_include_sha256, 3, 2, 1, 2)
+
+        opts_grid.setColumnStretch(1, 1)
+        opts_grid.setColumnStretch(3, 1)
+        layout.addWidget(opts_group)
+
+        # ----- Output + action -----
         out_row = QHBoxLayout()
         self.fmt_choose_out_btn = QPushButton("Choose Output Location…")
         self.fmt_choose_out_btn.clicked.connect(self.fmt_choose_output)
-        self.fmt_out_label = QLabel("Output: (will default once input is set)")
+        self.fmt_out_label = QLabel("Output: (default appears once a file is loaded)")
         self.fmt_out_label.setStyleSheet("color: #9d9d9d;")
         out_row.addWidget(self.fmt_choose_out_btn)
         out_row.addWidget(self.fmt_out_label, 1)
@@ -1246,7 +1322,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.fmt_open_folder_btn)
 
         layout.addStretch(1)
-        return page
+        scroll.setWidget(page)
+        return scroll
 
     # ---- formatter handlers ----
 
@@ -1291,6 +1368,7 @@ class MainWindow(QMainWindow):
         self._fmt_refresh_enabled()
 
     def _fmt_populate_mapping(self, cols: list) -> None:
+        # Single-value field dropdowns.
         for field, combo in self.fmt_combos.items():
             combo.blockSignals(True)
             combo.clear()
@@ -1304,6 +1382,49 @@ class MainWindow(QMainWindow):
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
             combo.blockSignals(False)
+
+        # Email & phone source checkable lists. Auto-check anything whose
+        # name matches the pattern lists; the user can uncheck what they
+        # don't want (e.g. unverified email columns).
+        self._fmt_fill_source_list(
+            self.fmt_email_list, cols, EMAIL_COLUMN_PATTERNS
+        )
+        self._fmt_fill_source_list(
+            self.fmt_phone_list, cols, PHONE_COLUMN_PATTERNS
+        )
+        self._fmt_update_source_counts()
+
+    @staticmethod
+    def _fmt_fill_source_list(
+        list_widget: QListWidget, cols: list, patterns: list
+    ) -> None:
+        list_widget.blockSignals(True)
+        list_widget.clear()
+        for c in cols:
+            item = QListWidgetItem(c)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            lower = c.lower()
+            is_match = any(p in lower for p in patterns)
+            item.setCheckState(
+                Qt.CheckState.Checked if is_match else Qt.CheckState.Unchecked
+            )
+            list_widget.addItem(item)
+        list_widget.blockSignals(False)
+
+    def _fmt_update_source_counts(self, *_args) -> None:
+        ec = self._fmt_checked_items(self.fmt_email_list)
+        pc = self._fmt_checked_items(self.fmt_phone_list)
+        self.fmt_email_count_label.setText(f"{len(ec)} selected")
+        self.fmt_phone_count_label.setText(f"{len(pc)} selected")
+
+    @staticmethod
+    def _fmt_checked_items(list_widget: QListWidget) -> list:
+        out = []
+        for i in range(list_widget.count()):
+            it = list_widget.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                out.append(it.text())
+        return out
 
     def _fmt_set_default_output(self, input_path: str) -> None:
         out_fmt = self._fmt_current_output_format()
@@ -1368,6 +1489,12 @@ class MainWindow(QMainWindow):
             val = combo.currentData()
             if val:
                 mapping[field] = val
+        email_sources = self._fmt_checked_items(self.fmt_email_list)
+        phone_sources = self._fmt_checked_items(self.fmt_phone_list)
+        if email_sources:
+            mapping["EMAIL_SOURCES"] = email_sources
+        if phone_sources:
+            mapping["PHONE_SOURCES"] = phone_sources
 
         sep_text = self.fmt_separator.currentText()
         separator = "\t" if "tab" in sep_text else sep_text.split(" ")[0]
@@ -1395,6 +1522,15 @@ class MainWindow(QMainWindow):
                 self,
                 "Nothing to output",
                 "Enable at least one of plaintext or SHA256 columns.",
+            )
+            return
+
+        if not mapping:
+            QMessageBox.warning(
+                self,
+                "Nothing to output",
+                "Map at least one field or check at least one email/phone "
+                "source column.",
             )
             return
 
